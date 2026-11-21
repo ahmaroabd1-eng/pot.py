@@ -828,4 +828,239 @@ owner_router.callback_query.filter(IsOwner())
 
 @owner_router.message(Command("owner"))
 async def owner_cmd(message: Message):
-    await message.answer("🛠 لوحة التح
+    await message.answer("🛠 لوحة التحكم", reply_markup=owner_kb())
+
+
+@owner_router.callback_query(F.data.in_({"menu:owner", "owner:panel"}))
+async def owner_panel(cb: CallbackQuery):
+    await cb.message.edit_text("🛠 لوحة التحكم", reply_markup=owner_kb())
+    await cb.answer()
+
+
+@owner_router.callback_query(F.data == "owner:stats")
+async def owner_stats(cb: CallbackQuery, session: AsyncSession):
+    s = await global_stats(session)
+    text = (
+        "📊 <b>إحصائيات عامة</b>\n\n"
+        f"👥 المستخدمين: {s['users']}\n"
+        f"🚫 المحظورين: {s['blocked']}\n"
+        f"📩 إجمالي الرسائل: {s['messages']}\n"
+        f"🔗 الروابط: {s['links']}\n"
+    )
+    await cb.message.edit_text(text, reply_markup=back_kb("owner:panel"))
+    await cb.answer()
+
+
+@owner_router.callback_query(F.data == "owner:search")
+async def owner_search_start(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(OwnerSearch.waiting)
+    await cb.message.edit_text("🔍 اكتب Telegram ID للمستخدم:", reply_markup=back_kb("owner:panel"))
+    await cb.answer()
+
+
+@owner_router.message(OwnerSearch.waiting, F.text)
+async def owner_search_run(message: Message, state: FSMContext, session: AsyncSession):
+    try:
+        uid = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ ID غير صالح.")
+        return
+    u = await get_user(session, uid)
+    if not u:
+        await message.answer("❌ المستخدم غير موجود.")
+        await state.clear()
+        return
+    text = (
+        f"👤 <b>{(u.first_name or '')} {(u.last_name or '')}</b>\n"
+        f"🆔 <code>{u.id}</code>\n"
+        f"🔗 @{u.username or '—'}\n"
+        f"🚫 محظور: {'نعم' if u.is_blocked else 'لا'}\n"
+        f"📅 انضم: {u.created_at:%Y-%m-%d}\n"
+    )
+    await message.answer(text, reply_markup=confirm_kb("toggle_block", u.id))
+    await state.clear()
+
+
+@owner_router.callback_query(F.data.startswith("confirm:toggle_block:"))
+async def owner_toggle_block(cb: CallbackQuery, session: AsyncSession):
+    uid = int(cb.data.split(":")[2])
+    u = await get_user(session, uid)
+    if not u:
+        await cb.answer("غير موجود", show_alert=True)
+        return
+    was_blocked = u.is_blocked
+    await block_user(session, uid, not was_blocked)
+    await cb.message.edit_text(
+        f"{'🚫 تم حظر' if not was_blocked else '✅ تم إلغاء حظر'} {uid}."
+    )
+    await cb.answer()
+
+
+@owner_router.callback_query(F.data == "owner:broadcast")
+async def owner_broadcast_start(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(OwnerBroadcast.waiting)
+    await cb.message.edit_text(
+        "📢 اكتب الرسالة اللي عايز تبعتها لكل المستخدمين:",
+        reply_markup=back_kb("owner:panel"),
+    )
+    await cb.answer()
+
+
+@owner_router.message(OwnerBroadcast.waiting, F.text)
+async def owner_broadcast_run(message: Message, state: FSMContext, session: AsyncSession):
+    await message.answer("⏳ جاري الإرسال...")
+    sent, failed = await broadcast(message.bot, session, message.text or "")
+    await message.answer(f"✅ تم الإرسال: {sent}\n❌ فشل: {failed}")
+    await state.clear()
+
+
+@owner_router.callback_query(F.data == "owner:reports")
+async def owner_reports(cb: CallbackQuery, session: AsyncSession):
+    reports = await list_pending_reports(session)
+    if not reports:
+        await cb.message.edit_text("لا توجد بلاغات.", reply_markup=back_kb("owner:panel"))
+        await cb.answer()
+        return
+    await cb.message.edit_text("🚩 البلاغات المعلقة:", reply_markup=back_kb("owner:panel"))
+    for r in reports:
+        await cb.message.answer(
+            f"بلاغ #{r.id}\nرسالة: {r.message_id}\nالسبب: {r.reason}\nالحالة: {r.status}"
+        )
+    await cb.answer()
+
+
+# --- Edit Texts ---
+
+@owner_router.callback_query(F.data == "owner:edit_texts")
+async def owner_edit_texts(cb: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="رسالة الترحيب", callback_data="edittext:welcome")],
+        [InlineKeyboardButton(text="رسالة المرسل المجهول", callback_data="edittext:anon_intro")],
+        [InlineKeyboardButton(text="↩️ رجوع", callback_data="owner:panel")]
+    ])
+    await cb.message.edit_text("اختر النص اللي عايز تعدله:", reply_markup=kb)
+    await cb.answer()
+
+
+@owner_router.callback_query(F.data.startswith("edittext:"))
+async def owner_edit_text_start(cb: CallbackQuery, state: FSMContext):
+    key = cb.data.split(":")[1]
+    await state.set_state(OwnerEditText.waiting)
+    await state.update_data(edit_key=f"text:{key}")
+    await cb.message.edit_text("✍️ اكتب النص الجديد دلوقتي وابعته:")
+    await cb.answer()
+
+
+@owner_router.message(OwnerEditText.waiting, F.text)
+async def owner_edit_text_save(message: Message, state: FSMContext, session: AsyncSession):
+    data = await state.get_data()
+    key = data.get("edit_key")
+    
+    try:
+        await message.bot.send_message(message.from_user.id, message.text)
+    except Exception:
+        await message.answer("❌ النص اللي كتبته فيه رموز مش مدعومة في تيليجرام (زي <escape> أو قوسين غلط).\nجرب تكتبه تاني بشكل صحيح:")
+        return 
+        
+    await set_setting(session, key, message.text)
+    await message.answer("✅ تم تعديل النص بنجاح.", reply_markup=owner_kb())
+    await state.clear()
+
+
+# --- Manage Buttons ---
+
+@owner_router.callback_query(F.data == "owner:manage_buttons")
+async def owner_manage_buttons(cb: CallbackQuery, session: AsyncSession):
+    buttons = await get_extra_buttons(session)
+    text = "➕ <b>إدارة الأزرار</b>\n\n"
+    if buttons:
+        text += "الأزرار الحالية:\n"
+        for b in buttons:
+            text += f"- {b['text']} ({b['url']})\n"
+    else:
+        text += "لا توجد أزرار إضافية حالياً.\n"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ إضافة زر جديد", callback_data="addbutton:start")],
+        [InlineKeyboardButton(text="🗑 حذف كل الأزرار", callback_data="addbutton:clear")],
+        [InlineKeyboardButton(text="↩️ رجوع", callback_data="owner:panel")]
+    ])
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@owner_router.callback_query(F.data == "addbutton:start")
+async def owner_add_button_start(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(OwnerAddButton.waiting_text)
+    await cb.message.edit_text("1️⃣ اكتب اسم الزر (مثال: قناتي):")
+    await cb.answer()
+
+
+@owner_router.message(OwnerAddButton.waiting_text, F.text)
+async def owner_add_button_text(message: Message, state: FSMContext):
+    await state.update_data(btn_text=message.text)
+    await state.set_state(OwnerAddButton.waiting_url)
+    await message.answer("2️⃣ اكتب الرابط (مثال: https://t.me/yourchannel)\n\n⚠️ لازم يكون رابط صحيح.")
+
+
+@owner_router.message(OwnerAddButton.waiting_url, F.text)
+async def owner_add_button_url(message: Message, state: FSMContext, session: AsyncSession):
+    url = message.text.strip()
+    if not url.startswith("http"):
+        await message.answer("❌ رابط غير صالح. لازم يبدأ بـ http أو https.")
+        return
+    data = await state.get_data()
+    btn_text = data.get("btn_text")
+    buttons = await get_extra_buttons(session)
+    buttons.append({"text": btn_text, "url": url})
+    await save_extra_buttons(session, buttons)
+    await message.answer("✅ تم إضافة الزر بنجاح.", reply_markup=owner_kb())
+    await state.clear()
+
+
+@owner_router.callback_query(F.data == "addbutton:clear")
+async def owner_add_button_clear(cb: CallbackQuery, session: AsyncSession):
+    await save_extra_buttons(session, [])
+    await cb.message.edit_text("🗑 تم حذف كل الأزرار.", reply_markup=owner_kb())
+    await cb.answer()
+
+
+# ============================================================
+# BOOTSTRAP
+# ============================================================
+
+
+async def on_startup(bot: Bot):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Bot started in polling mode")
+
+
+async def on_shutdown(bot: Bot):
+    await engine.dispose()
+
+
+async def main():
+    bot = Bot(
+        token=settings.bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.update.middleware(DbSessionMiddleware())
+    dp.update.middleware(UserMiddleware())
+    dp.message.middleware(ThrottlingMiddleware(rate=10))
+    dp.include_router(owner_router)
+    dp.include_router(anon_router)
+    dp.include_router(user_router)
+
+    await on_startup(bot)
+    
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        await on_shutdown(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
