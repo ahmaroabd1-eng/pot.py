@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     bot_token: str
     owner_id: int
-    database_url: str = "sqlite+aiosqlite:///sarehni_v2.db" # تم تغيير اسم الداتابيز لملف جديد
+    database_url: str = "sqlite+aiosqlite:///sarehni_v3.db" # غيرت الاسم عشان نبدأ من جديد ونضيف حقل الاسم
 
 
 settings = Settings()
@@ -105,8 +105,6 @@ class Whisper(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     owner_id: Mapped[int] = mapped_column(BigInteger, index=True)
     text: Mapped[str] = mapped_column(Text)
-    original_text: Mapped[str] = mapped_column(Text)
-    viewers_list: Mapped[str] = mapped_column(Text, default="")
     target_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
     target_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     max_views: Mapped[int] = mapped_column(Integer, default=1000)
@@ -118,6 +116,7 @@ class WhisperView(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     whisper_id: Mapped[int] = mapped_column(Integer, ForeignKey("whispers.id", ondelete="CASCADE"), index=True)
     viewer_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    viewer_name: Mapped[str] = mapped_column(String(128)) # حفظ الاسم عشان يظهر في الزرار
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 # ============================================================
@@ -329,7 +328,6 @@ async def inline_whisper(query: InlineQuery, session: AsyncSession):
         w = Whisper(
             owner_id=query.from_user.id, 
             text=whisper_text, 
-            original_text=whisper_text, 
             max_views=max_views, 
             target_username=target, 
             target_id=tid
@@ -340,16 +338,17 @@ async def inline_whisper(query: InlineQuery, session: AsyncSession):
         
         target_msg = f"لشخص: {target}" if target else ("للجميع" if max_views > 100 else f"لأول {max_views} أشخاص")
         
+        # الرسالة في القناة بدون النص الأصلي
         results.append(InlineQueryResultArticle(
             id=str(w.id),
             title=title,
             description=f"اضغط لإرسال همسة {target_msg}",
             input_message_content=InputTextMessageContent(
-                message_text=f"🤫 <b>همسة سرية {target_msg}</b>\n\n{w.original_text}\n\n👤 <b>الذين فتحوها:</b>\nلا يوجد بعد.",
+                message_text=f"🤫 <b>هذه همسة نصية سرية {target_msg}</b>\n\nاضغط على الزر بالأسفل لفتحها.",
                 parse_mode=ParseMode.HTML
             ),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🤫 افتح الهمسة", callback_data=f"open_whisper:{w.id}")]
+                [InlineKeyboardButton(text="افتح الهمسة 🤫", callback_data=f"open_whisper:{w.id}")]
             ])
         ))
 
@@ -395,44 +394,50 @@ async def open_whisper_cb(cb: CallbackQuery, session: AsyncSession):
         await cb.answer("انتهت هذه الهمسة، لقد قرأها العدد المطلوب.", show_alert=True)
         return
 
-    view = WhisperView(whisper_id=wid, viewer_id=cb.from_user.id)
-    session.add(view)
-    w.current_views += 1
-    
     viewer_name = " ".join(p for p in [cb.from_user.first_name or "", cb.from_user.last_name or ""] if p) or "مستخدم"
     
-    if w.viewers_list:
-        w.viewers_list += f"\n- {escape(viewer_name)}"
-    else:
-        w.viewers_list = f"\n- {escape(viewer_name)}"
-        
+    # تسجيل المشاهدة مع الاسم
+    view = WhisperView(whisper_id=wid, viewer_id=cb.from_user.id, viewer_name=viewer_name)
+    session.add(view)
+    w.current_views += 1
     await session.commit()
 
-    owner_name = " ".join(p for p in [cb.from_user.first_name or "", cb.from_user.last_name or ""] if p) or "مستخدم"
+    # إرسال إشعار لصاحب الهمسة
     owner_uname = f"@{cb.from_user.username}" if cb.from_user.username else "—"
     try:
         await cb.bot.send_message(
             w.owner_id,
-            f"📢 <b>شخص فتح همستك!</b>\n\n👤 الاسم: {escape(owner_name)}\n🔗 اليوزر: {owner_uname}\n🆔 الإيدي: <code>{cb.from_user.id}</code>\n\n📊 العدد الحالي: {w.current_views} من {w.max_views}",
+            f"📢 <b>شخص فتح همستك!</b>\n\n👤 الاسم: {escape(viewer_name)}\n🔗 اليوزر: {owner_uname}\n🆔 الإيدي: <code>{cb.from_user.id}</code>\n\n📊 العدد الحالي: {w.current_views} من {w.max_views}",
             parse_mode=ParseMode.HTML
         )
     except Exception:
         pass
 
-    target_msg = f"لشخص: {w.target_username}" if w.target_username else ("للجميع" if w.max_views > 100 else f"لأول {w.max_views} أشخاص")
-    new_text = f"🤫 <b>همسة سرية {target_msg}</b>\n\n{w.original_text}\n\n👤 <b>الذين فتحوها:</b>{w.viewers_list}"
+    # جلب كل الأسماء اللي فتحت
+    views = (await session.execute(select(WhisperView).where(WhisperView.whisper_id == wid).order_by(WhisperView.created_at))).scalars().all()
     
+    # بناء الأزرار الجديدة
+    kb_rows = [[InlineKeyboardButton(text="افتح الهمسة 🤫", callback_data=f"open_whisper:{w.id}")]]
+    for v in views:
+        kb_rows.append([InlineKeyboardButton(text=f"{v.viewer_name} 👁", callback_data="ignore_click")])
+        
+    new_kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    
+    # تحديث الأزرار في القناة
     try:
-        await cb.bot.edit_message_text(
+        await cb.bot.edit_message_reply_markup(
             inline_message_id=cb.inline_message_id,
-            text=new_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=cb.message.reply_markup if cb.message else InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🤫 افتح الهمسة", callback_data=f"open_whisper:{w.id}")]])
+            reply_markup=new_kb
         )
     except Exception as e:
-        logger.warning(f"Failed to edit whisper: {e}")
+        logger.warning(f"Failed to edit whisper keyboard: {e}")
 
+    # إظهار النص في رسالة منبثقة
     await cb.answer(w.text, show_alert=True)
+
+@inline_router.callback_query(F.data == "ignore_click")
+async def ignore_click(cb: CallbackQuery):
+    await cb.answer("هذا الشخص فتح الهمسة بالفعل 👁", show_alert=False)
 
 
 # ============================================================
