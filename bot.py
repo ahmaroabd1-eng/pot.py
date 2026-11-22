@@ -15,7 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
-    InlineQuery, InlineQueryResultArticle, InputTextMessageContent, ChosenInlineResult
+    InlineQuery, InlineQueryResultArticle, InputTextMessageContent
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import (
@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     bot_token: str
     owner_id: int
-    database_url: str = "sqlite+aiosqlite:///sarehni.db"
+    database_url: str = "sqlite+aiosqlite:///sarehni_v2.db" # تم تغيير اسم الداتابيز لملف جديد
 
 
 settings = Settings()
@@ -81,7 +81,7 @@ class MessageModel(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     receiver_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), index=True)
     sender_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
-    bot_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True) # لحفظ ID رسالة البوت عشان الرد
+    bot_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     content_type: Mapped[str] = mapped_column(String(32), default="text")
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
@@ -92,15 +92,6 @@ class BlockedSender(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     receiver_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), index=True)
     sender_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-class Report(Base):
-    __tablename__ = "reports"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    message_id: Mapped[int] = mapped_column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), index=True)
-    reporter_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"))
-    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    status: Mapped[str] = mapped_column(String(16), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 class BotSetting(Base):
@@ -114,6 +105,8 @@ class Whisper(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     owner_id: Mapped[int] = mapped_column(BigInteger, index=True)
     text: Mapped[str] = mapped_column(Text)
+    original_text: Mapped[str] = mapped_column(Text)
+    viewers_list: Mapped[str] = mapped_column(Text, default="")
     target_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
     target_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     max_views: Mapped[int] = mapped_column(Integer, default=1000)
@@ -238,9 +231,6 @@ class IsOwner(BaseFilter):
 class SendAnonymous(StatesGroup):
     waiting = State()
 
-class OwnerBroadcast(StatesGroup):
-    waiting = State()
-
 class OwnerEditText(StatesGroup):
     waiting = State()
 
@@ -303,8 +293,6 @@ def reaction_kb(mid: int) -> InlineKeyboardMarkup:
 
 def owner_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 إحصائيات عامة", callback_data="owner:stats")],
-        [InlineKeyboardButton(text="📢 رسالة جماعية", callback_data="owner:broadcast")],
         [InlineKeyboardButton(text="✏️ تعديل النصوص", callback_data="owner:edit_texts")],
         [InlineKeyboardButton(text="↩️ رجوع", callback_data="menu:main")],
     ])
@@ -327,7 +315,6 @@ async def inline_whisper(query: InlineQuery, session: AsyncSession):
     if not text:
         return
     
-    # التحقق لو النص فيه @username في الآخر
     parts = text.rsplit(" ", 1)
     target_user = None
     whisper_text = text
@@ -339,8 +326,14 @@ async def inline_whisper(query: InlineQuery, session: AsyncSession):
     results = []
     
     async def create_whisper_result(title: str, max_views: int, target: str = None, tid: int = None):
-        # إنشاء الهمسة في الداتابيز عشان نضمن أمان البيانات
-        w = Whisper(owner_id=query.from_user.id, text=whisper_text, max_views=max_views, target_username=target, target_id=tid)
+        w = Whisper(
+            owner_id=query.from_user.id, 
+            text=whisper_text, 
+            original_text=whisper_text, 
+            max_views=max_views, 
+            target_username=target, 
+            target_id=tid
+        )
         session.add(w)
         await session.commit()
         await session.refresh(w)
@@ -352,7 +345,7 @@ async def inline_whisper(query: InlineQuery, session: AsyncSession):
             title=title,
             description=f"اضغط لإرسال همسة {target_msg}",
             input_message_content=InputTextMessageContent(
-                message_text=f"🤫 <b>همسة سرية {target_msg}</b>\n\nاضغط على الزر بالأسفل لرؤية الهمسة.",
+                message_text=f"🤫 <b>همسة سرية {target_msg}</b>\n\n{w.original_text}\n\n👤 <b>الذين فتحوها:</b>\nلا يوجد بعد.",
                 parse_mode=ParseMode.HTML
             ),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -361,7 +354,6 @@ async def inline_whisper(query: InlineQuery, session: AsyncSession):
         ))
 
     if target_user:
-        # همسة لشخص محدد (مثلاً @username)
         await create_whisper_result(f"🔒 همسة لشخص محدد ({target_user})", 1000, target=target_user)
     else:
         await create_whisper_result("🌍 همسة سرية للجميع", 999999)
@@ -383,13 +375,15 @@ async def open_whisper_cb(cb: CallbackQuery, session: AsyncSession):
         await cb.answer("هذه الهمسة غير موجودة أو تم حذفها.", show_alert=True)
         return
 
-    # التحقق لو الشخص ده فتحها قبل كده
+    if cb.from_user.id == w.owner_id:
+        await cb.answer(f"أنت صاحب الهمسة! 🤫\n\nالهمسة: {w.text}", show_alert=True)
+        return
+
     viewed = (await session.execute(select(WhisperView).where(WhisperView.whisper_id == wid, WhisperView.viewer_id == cb.from_user.id))).scalar_one_or_none()
     if viewed:
         await cb.answer("أنت بالفعل فتحت هذه الهمسة من قبل! 🤫", show_alert=True)
         return
 
-    # التحقق من الشخص المخصص
     if w.target_username and cb.from_user.username != w.target_username:
         await cb.answer("عذراً، هذه الهمسة ليست لك.", show_alert=True)
         return
@@ -397,18 +391,23 @@ async def open_whisper_cb(cb: CallbackQuery, session: AsyncSession):
         await cb.answer("عذراً، هذه الهمسة ليست لك.", show_alert=True)
         return
 
-    # التحقق من العدد
     if w.current_views >= w.max_views:
         await cb.answer("انتهت هذه الهمسة، لقد قرأها العدد المطلوب.", show_alert=True)
         return
 
-    # تسجيل القراءة
     view = WhisperView(whisper_id=wid, viewer_id=cb.from_user.id)
     session.add(view)
     w.current_views += 1
+    
+    viewer_name = " ".join(p for p in [cb.from_user.first_name or "", cb.from_user.last_name or ""] if p) or "مستخدم"
+    
+    if w.viewers_list:
+        w.viewers_list += f"\n- {escape(viewer_name)}"
+    else:
+        w.viewers_list = f"\n- {escape(viewer_name)}"
+        
     await session.commit()
 
-    # إرسال إشعار لصاحب الهمسة
     owner_name = " ".join(p for p in [cb.from_user.first_name or "", cb.from_user.last_name or ""] if p) or "مستخدم"
     owner_uname = f"@{cb.from_user.username}" if cb.from_user.username else "—"
     try:
@@ -420,12 +419,24 @@ async def open_whisper_cb(cb: CallbackQuery, session: AsyncSession):
     except Exception:
         pass
 
-    # إظهار الهمسة للمستخدم
+    target_msg = f"لشخص: {w.target_username}" if w.target_username else ("للجميع" if w.max_views > 100 else f"لأول {w.max_views} أشخاص")
+    new_text = f"🤫 <b>همسة سرية {target_msg}</b>\n\n{w.original_text}\n\n👤 <b>الذين فتحوها:</b>{w.viewers_list}"
+    
+    try:
+        await cb.bot.edit_message_text(
+            inline_message_id=cb.inline_message_id,
+            text=new_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=cb.message.reply_markup if cb.message else InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🤫 افتح الهمسة", callback_data=f"open_whisper:{w.id}")]])
+        )
+    except Exception as e:
+        logger.warning(f"Failed to edit whisper: {e}")
+
     await cb.answer(w.text, show_alert=True)
 
 
 # ============================================================
-# HANDLERS — ANONYMOUS (EXISTING)
+# HANDLERS — ANONYMOUS
 # ============================================================
 
 anon_router = Router(name="anon")
@@ -481,17 +492,14 @@ async def receive_anon(message: Message, state: FSMContext, session: AsyncSessio
     header = f"📩 <b>رسالة #{msg.id}</b>"
     tail = sender_line(sender)
     
-    # إرسال للطرف التاني
     try:
         if ctype == "text":
             sent_bot_msg = await message.bot.send_message(receiver_id, f"{header}\n\n{escape(content)}{tail}", reply_markup=msg_actions(msg.id, message.from_user.id))
         elif ctype == "photo":
             sent_bot_msg = await message.bot.send_photo(receiver_id, content, caption=header + tail, reply_markup=msg_actions(msg.id, message.from_user.id))
-        # ... ممكن نكمل باقي الأنواع هنا لو حابب
         else:
             sent_bot_msg = await message.bot.send_message(receiver_id, f"{header}\n\n{escape(content)}{tail}", reply_markup=msg_actions(msg.id, message.from_user.id))
         
-        # حفظ ID رسالة البوت عشان الرد
         msg.bot_message_id = sent_bot_msg.message_id
         await session.commit()
     except Exception:
@@ -500,7 +508,6 @@ async def receive_anon(message: Message, state: FSMContext, session: AsyncSessio
     sent_text = await get_dynamic_text(session, "text:anon_sent", DEFAULT_ANON_SENT)
     await message.answer(sent_text)
     await state.clear()
-
 
 @anon_router.message(SendAnonymous.waiting)
 async def wrong_input(message: Message):
@@ -531,16 +538,12 @@ async def menu_main(cb: CallbackQuery, state: FSMContext, session: AsyncSession)
 
 @user_router.message(F.reply_to_message)
 async def handle_reply(message: Message, session: AsyncSession):
-    """التعامل مع الرد المباشر على رسالة البوت"""
     replied_msg_id = message.reply_to_message.message_id
-    
-    # البحث عن الرسالة الأصلية في الداتابيز
     original_msg = (await session.execute(select(MessageModel).where(MessageModel.bot_message_id == replied_msg_id, MessageModel.receiver_id == message.from_user.id))).scalar_one_or_none()
     
     if not original_msg or not original_msg.sender_id:
-        return # مش رسالة مجهولة أو مفيش مرسل
+        return 
 
-    # إرسال الرد للمرسل الأصلي
     reply_text = await get_dynamic_text(session, "text:reply_received", DEFAULT_REPLY_RECEIVED)
     reply_text = reply_text.replace("{text}", escape(message.text or ""))
     
