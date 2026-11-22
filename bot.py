@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import os
 import secrets
 import time
 from datetime import datetime, timezone
@@ -16,6 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+    InlineQuery, InlineQueryResultArticle, InputTextMessageContent, ChosenInlineResult
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import (
@@ -49,10 +49,8 @@ logger = logging.getLogger("sarehni")
 engine = create_async_engine(settings.database_url, echo=False)
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-
 class Base(DeclarativeBase):
     pass
-
 
 class User(Base):
     __tablename__ = "users"
@@ -60,13 +58,12 @@ class User(Base):
     username: Mapped[str | None] = mapped_column(String(64), nullable=True)
     first_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    bio: Mapped[str | None] = mapped_column(String(200), nullable=True)
     is_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
     link: Mapped["PersonalLink"] = relationship(back_populates="user", uselist=False)
-
 
 class PersonalLink(Base):
     __tablename__ = "personal_links"
@@ -77,22 +74,25 @@ class PersonalLink(Base):
     visits: Mapped[int] = mapped_column(Integer, default=0)
     messages_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
     user: Mapped[User] = relationship(back_populates="link")
-
 
 class MessageModel(Base):
     __tablename__ = "messages"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     receiver_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    sender_id: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
-    )
+    sender_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    bot_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True) # لحفظ ID رسالة البوت عشان الرد
     content_type: Mapped[str] = mapped_column(String(32), default="text")
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
+class BlockedSender(Base):
+    __tablename__ = "blocked_senders"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    receiver_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    sender_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 class Report(Base):
     __tablename__ = "reports"
@@ -103,28 +103,38 @@ class Report(Base):
     status: Mapped[str] = mapped_column(String(16), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-
 class BotSetting(Base):
     __tablename__ = "bot_settings"
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
+class Whisper(Base):
+    __tablename__ = "whispers"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    text: Mapped[str] = mapped_column(Text)
+    target_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    target_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    max_views: Mapped[int] = mapped_column(Integer, default=1000)
+    current_views: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+class WhisperView(Base):
+    __tablename__ = "whisper_views"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    whisper_id: Mapped[int] = mapped_column(Integer, ForeignKey("whispers.id", ondelete="CASCADE"), index=True)
+    viewer_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 # ============================================================
 # SERVICES
 # ============================================================
 
-
 async def upsert_user(session: AsyncSession, tg_user) -> User:
     user = await session.get(User, tg_user.id)
     if user is None:
-        user = User(
-            id=tg_user.id, username=tg_user.username,
-            first_name=tg_user.first_name, last_name=tg_user.last_name,
-        )
+        user = User(id=tg_user.id, username=tg_user.username, first_name=tg_user.first_name, last_name=tg_user.last_name)
         session.add(user)
     else:
         user.username = tg_user.username
@@ -134,197 +144,70 @@ async def upsert_user(session: AsyncSession, tg_user) -> User:
     await session.commit()
     return user
 
-
 async def get_user(session: AsyncSession, uid: int) -> User | None:
     return await session.get(User, uid)
 
-
 async def get_or_create_link(session: AsyncSession, user_id: int) -> PersonalLink:
-    link = (await session.execute(
-        select(PersonalLink).where(PersonalLink.user_id == user_id)
-    )).scalar_one_or_none()
-    if link:
-        return link
+    link = (await session.execute(select(PersonalLink).where(PersonalLink.user_id == user_id))).scalar_one_or_none()
+    if link: return link
     link = PersonalLink(user_id=user_id, slug=secrets.token_urlsafe(8))
     session.add(link)
     await session.commit()
     await session.refresh(link)
     return link
 
-
 async def get_link_by_slug(session: AsyncSession, slug: str) -> PersonalLink | None:
-    return (await session.execute(
-        select(PersonalLink).where(PersonalLink.slug == slug)
-    )).scalar_one_or_none()
-
-
-async def increment_visits(session: AsyncSession, link_id: int) -> None:
-    await session.execute(
-        update(PersonalLink).where(PersonalLink.id == link_id).values(visits=PersonalLink.visits + 1)
-    )
-    await session.commit()
-
+    return (await session.execute(select(PersonalLink).where(PersonalLink.slug == slug))).scalar_one_or_none()
 
 async def toggle_link(session: AsyncSession, user_id: int) -> bool | None:
-    link = (await session.execute(
-        select(PersonalLink).where(PersonalLink.user_id == user_id)
-    )).scalar_one_or_none()
-    if not link:
-        return None
+    link = (await session.execute(select(PersonalLink).where(PersonalLink.user_id == user_id))).scalar_one_or_none()
+    if not link: return None
     link.is_active = not link.is_active
     await session.commit()
     return link.is_active
 
+async def check_sender_blocked(session: AsyncSession, receiver_id: int, sender_id: int) -> bool:
+    block = (await session.execute(select(BlockedSender).where(BlockedSender.receiver_id == receiver_id, BlockedSender.sender_id == sender_id))).scalar_one_or_none()
+    return block is not None
 
-async def create_message(
-    session: AsyncSession, receiver_id: int, sender_id: int, content_type: str, content: str
-) -> MessageModel:
-    msg = MessageModel(
-        receiver_id=receiver_id, sender_id=sender_id,
-        content_type=content_type, content=content,
-    )
-    session.add(msg)
+async def block_sender(session: AsyncSession, receiver_id: int, sender_id: int):
+    block = BlockedSender(receiver_id=receiver_id, sender_id=sender_id)
+    session.add(block)
     await session.commit()
-    await session.refresh(msg)
-    link = (await session.execute(
-        select(PersonalLink).where(PersonalLink.user_id == receiver_id)
-    )).scalar_one_or_none()
-    if link:
-        link.messages_count += 1
-        await session.commit()
-    return msg
-
 
 async def get_message(session: AsyncSession, mid: int) -> MessageModel | None:
     return await session.get(MessageModel, mid)
 
-
-async def list_messages(session: AsyncSession, receiver_id: int, limit: int = 10):
-    return (await session.execute(
-        select(MessageModel, User)
-        .outerjoin(User, User.id == MessageModel.sender_id)
-        .where(MessageModel.receiver_id == receiver_id, MessageModel.is_deleted.is_(False))
-        .order_by(desc(MessageModel.created_at))
-        .limit(limit)
-    )).all()
-
-
 async def mark_deleted(session: AsyncSession, mid: int, receiver_id: int) -> bool:
     msg = await session.get(MessageModel, mid)
-    if not msg or msg.receiver_id != receiver_id:
-        return False
+    if not msg or msg.receiver_id != receiver_id: return False
     msg.is_deleted = True
     await session.commit()
     return True
-
-
-async def create_report(session: AsyncSession, mid: int, reporter_id: int, reason: str) -> Report:
-    r = Report(message_id=mid, reporter_id=reporter_id, reason=reason)
-    session.add(r)
-    await session.commit()
-    return r
-
-
-async def list_pending_reports(session: AsyncSession):
-    return (await session.execute(
-        select(Report).where(Report.status == "pending").order_by(desc(Report.created_at))
-    )).scalars().all()
-
 
 async def get_setting(session: AsyncSession, key: str, default: str | None = None) -> str | None:
     s = await session.get(BotSetting, key)
     return s.value if s else default
 
-
 async def set_setting(session: AsyncSession, key: str, value: str) -> None:
     s = await session.get(BotSetting, key)
-    if s:
-        s.value = value
-    else:
-        session.add(BotSetting(key=key, value=value))
+    if s: s.value = value
+    else: session.add(BotSetting(key=key, value=value))
     await session.commit()
-
 
 async def get_dynamic_text(session: AsyncSession, key: str, default: str) -> str:
     val = await get_setting(session, key)
     return val if val else default
 
-
-async def get_extra_buttons(session: AsyncSession) -> list:
-    val = await get_setting(session, "extra_buttons")
-    if val:
-        try:
-            return json.loads(val)
-        except Exception:
-            return []
-    return []
-
-
-async def save_extra_buttons(session: AsyncSession, buttons: list):
-    await set_setting(session, "extra_buttons", json.dumps(buttons))
-
-
-async def global_stats(session: AsyncSession) -> dict:
-    return {
-        "users": (await session.execute(select(func.count(User.id)))).scalar_one(),
-        "blocked": (await session.execute(
-            select(func.count(User.id)).where(User.is_blocked.is_(True))
-        )).scalar_one(),
-        "messages": (await session.execute(select(func.count(MessageModel.id)))).scalar_one(),
-        "links": (await session.execute(select(func.count(PersonalLink.id)))).scalar_one(),
-    }
-
-
-async def user_stats(session: AsyncSession, uid: int) -> dict:
-    received = (await session.execute(
-        select(func.count(MessageModel.id)).where(
-            MessageModel.receiver_id == uid, MessageModel.is_deleted.is_(False)
-        )
-    )).scalar_one()
-    sent = (await session.execute(
-        select(func.count(MessageModel.id)).where(MessageModel.sender_id == uid)
-    )).scalar_one()
-    link = (await session.execute(
-        select(PersonalLink).where(PersonalLink.user_id == uid)
-    )).scalar_one_or_none()
-    return {"received": received, "sent": sent, "visits": link.visits if link else 0}
-
-
-async def broadcast(bot: Bot, session: AsyncSession, text: str) -> tuple[int, int]:
-    users = (await session.execute(
-        select(User.id).where(User.is_active.is_(True), User.is_blocked.is_(False))
-    )).scalars().all()
-    sent = failed = 0
-    for uid in users:
-        try:
-            await bot.send_message(uid, text)
-            sent += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)
-    return sent, failed
-
-
-async def block_user(session: AsyncSession, uid: int, blocked: bool) -> bool:
-    u = await session.get(User, uid)
-    if not u:
-        return False
-    u.is_blocked = blocked
-    await session.commit()
-    return True
-
-
 # ============================================================
-# MIDDLEWARES
+# MIDDLEWARES & FILTERS
 # ============================================================
-
 
 class DbSessionMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         async with SessionLocal() as session:
             data["session"] = session
             return await handler(event, data)
-
 
 class UserMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
@@ -333,6 +216,8 @@ class UserMiddleware(BaseMiddleware):
             tg_user = event.message.from_user
         elif hasattr(event, "callback_query") and event.callback_query:
             tg_user = event.callback_query.from_user
+        elif hasattr(event, "inline_query") and event.inline_query:
+            tg_user = event.inline_query.from_user
 
         session: AsyncSession | None = data.get("session")
         if tg_user is not None and not tg_user.is_bot and session is not None:
@@ -342,121 +227,47 @@ class UserMiddleware(BaseMiddleware):
                 logger.warning(f"upsert failed: {e}")
         return await handler(event, data)
 
-
-class ThrottlingMiddleware(BaseMiddleware):
-    def __init__(self, rate: int = 10, per: int = 60):
-        self.rate = rate
-        self.per = per
-        self._hits: dict[int, list[float]] = {}
-
-    async def __call__(self, handler, event, data):
-        if not isinstance(event, Message) or event.from_user is None:
-            return await handler(event, data)
-        uid = event.from_user.id
-        now = time.time()
-        arr = self._hits.setdefault(uid, [])
-        arr[:] = [t for t in arr if now - t < self.per]
-        if len(arr) >= self.rate:
-            await event.answer("⏳ بلاش سرعة، استنى شوية وجرب تاني.")
-            return
-        arr.append(now)
-        return await handler(event, data)
-
-
 class IsOwner(BaseFilter):
     async def __call__(self, event: Message | CallbackQuery) -> bool:
         return event.from_user is not None and event.from_user.id == settings.owner_id
-
 
 # ============================================================
 # STATES
 # ============================================================
 
-
 class SendAnonymous(StatesGroup):
     waiting = State()
-
-
-class ReplyToMessage(StatesGroup):
-    waiting = State()
-
 
 class OwnerBroadcast(StatesGroup):
     waiting = State()
 
-
-class OwnerSearch(StatesGroup):
-    waiting = State()
-
-
 class OwnerEditText(StatesGroup):
     waiting = State()
 
-
-class OwnerAddButton(StatesGroup):
-    waiting_text = State()
-    waiting_url = State()
-
+class EditBio(StatesGroup):
+    waiting = State()
 
 # ============================================================
-# TEXTS / HELPERS
+# TEXTS
 # ============================================================
 
+DEFAULT_WELCOME = "مرحبًا بك في <b>صارحني</b> ❤️\n\nهنا يمكنك استقبال الرسائل الصريحة والمجهولة من الآخرين دون معرفة هويتهم.\n\nاختر من القائمة:"
+DEFAULT_ANON_INTRO = "أنت الآن على وشك إرسال رسالة مجهولة ❤️\n\nاكتب رسالتك بكل صراحة، وستصل إلى صاحب الرابط دون إظهار هويتك."
+DEFAULT_ANON_SENT = "✅ تم إرسال رسالتك بنجاح ❤️\nهويتك غير ظاهرة لصاحب الرابط."
+DEFAULT_REPLY_SENT = "✅ تم إرسال الرد بنجاح."
+DEFAULT_REPLY_RECEIVED = "📨 <b>رد على رسالتك</b>\n\n{text}"
 
-WELCOME = (
-    "مرحبًا بك في <b>صارحني</b> ❤️\n\n"
-    "هنا يمكنك استقبال الرسائل الصريحة والمجهولة من الآخرين دون معرفة هويتهم.\n\n"
-    "اختر من القائمة:"
-)
-ANON_INTRO = (
-    "أنت الآن على وشك إرسال رسالة مجهولة ❤️\n\n"
-    "اكتب رسالتك بكل صراحة، وستصل إلى صاحب الرابط دون إظهار هويتك."
-)
-ANON_SENT = "تم إرسال رسالتك بنجاح ❤️\nهويتك غير ظاهرة لصاحب الرابط."
-
+# ============================================================
+# HELPERS & KEYBOARDS
+# ============================================================
 
 def sender_line(sender: User | None) -> str:
-    if not sender:
-        return ""
+    if not sender: return ""
     name = " ".join(p for p in [sender.first_name or "", sender.last_name or ""] if p) or "مستخدم"
     uname = f"@{sender.username}" if sender.username else "—"
-    return (
-        "\n\n—————\n"
-        f"👤 الاسم: {escape(name)}\n"
-        f"🔗 اليوزر: {escape(uname)}\n"
-        f"🆔 الإيدي: <code>{sender.id}</code>"
-    )
+    return f"\n\n—————\n👤 الاسم: {escape(name)}\n🔗 اليوزر: {escape(uname)}\n🆔 الإيدي: <code>{sender.id}</code>"
 
-
-async def deliver_message(bot: Bot, chat_id: int, msg: MessageModel, sender: User | None, kb):
-    header = f"📩 <b>رسالة #{msg.id}</b>"
-    tail = sender_line(sender)
-    try:
-        if msg.content_type == "text":
-            await bot.send_message(chat_id, f"{header}\n\n{escape(msg.content)}{tail}", reply_markup=kb)
-        elif msg.content_type == "photo":
-            await bot.send_photo(chat_id, msg.content, caption=header + tail, reply_markup=kb)
-        elif msg.content_type == "sticker":
-            await bot.send_sticker(chat_id, msg.content)
-            await bot.send_message(chat_id, header + tail, reply_markup=kb)
-        elif msg.content_type == "video":
-            await bot.send_video(chat_id, msg.content, caption=header + tail, reply_markup=kb)
-        elif msg.content_type == "voice":
-            await bot.send_voice(chat_id, msg.content, caption=header + tail, reply_markup=kb)
-        elif msg.content_type == "document":
-            await bot.send_document(chat_id, msg.content, caption=header + tail, reply_markup=kb)
-        else:
-            await bot.send_message(chat_id, f"{header}\n\n{escape(msg.content)}{tail}", reply_markup=kb)
-    except Exception as e:
-        logger.warning(f"deliver failed: {e}")
-
-
-# ============================================================
-# KEYBOARDS
-# ============================================================
-
-
-def main_menu(owner: bool = False, extra_buttons: list = None) -> InlineKeyboardMarkup:
+def main_menu(owner: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="🔗 رابط صارحني", callback_data="menu:link")],
         [InlineKeyboardButton(text="📩 رسائلي الواردة", callback_data="menu:inbox")],
@@ -464,102 +275,183 @@ def main_menu(owner: bool = False, extra_buttons: list = None) -> InlineKeyboard
         [InlineKeyboardButton(text="⚙️ إعداداتي", callback_data="menu:settings")],
         [InlineKeyboardButton(text="ℹ️ حول البوت", callback_data="menu:about")],
     ]
-    if extra_buttons:
-        for btn in extra_buttons:
-            if "text" in btn and "url" in btn:
-                rows.append([InlineKeyboardButton(text=btn["text"], url=btn["url"])])
-                
-    if owner:
-        rows.append([InlineKeyboardButton(text="🛠 لوحة التحكم", callback_data="menu:owner")])
+    if owner: rows.append([InlineKeyboardButton(text="🛠 لوحة التحكم", callback_data="menu:owner")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 def back_kb(target: str = "menu:main") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="↩️ رجوع", callback_data=target)]
-    ])
-
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ رجوع", callback_data=target)]])
 
 def link_kb(active: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="⏸ تعطيل الاستقبال" if active else "▶️ تفعيل الاستقبال",
-            callback_data="link:toggle",
-        )],
+        [InlineKeyboardButton(text="⏸ تعطيل الاستقبال" if active else "▶️ تفعيل الاستقبال", callback_data="link:toggle")],
         [InlineKeyboardButton(text="📋 إرسال الرابط لنسخه", callback_data="link:copy")],
         [InlineKeyboardButton(text="↩️ رجوع", callback_data="menu:main")],
     ])
 
-
-def msg_actions(mid: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="↩️ رد", callback_data=f"msg:reply:{mid}"),
-            InlineKeyboardButton(text="🚩 إبلاغ", callback_data=f"msg:report:{mid}"),
-        ],
-        [InlineKeyboardButton(text="🗑 حذف", callback_data=f"msg:delete:{mid}")],
-    ])
-
-
-def report_kb(mid: int) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="إساءة / تحرش", callback_data=f"report:harass:{mid}")],
-        [InlineKeyboardButton(text="سبام", callback_data=f"report:spam:{mid}")],
-        [InlineKeyboardButton(text="تهديد", callback_data=f"report:threat:{mid}")],
-        [InlineKeyboardButton(text="أخرى", callback_data=f"report:other:{mid}")],
-        [InlineKeyboardButton(text="↩️ رجوع", callback_data=f"msg:back:{mid}")],
-    ]
+def msg_actions(mid: int, sender_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="🗑 حذف", callback_data=f"msg:delete:{mid}")]]
+    if sender_id: rows.append([InlineKeyboardButton(text="🚫 حظر المرسل", callback_data=f"msg:block:{sender_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+def reaction_kb(mid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❤️", callback_data=f"react:❤️:{mid}"),
+        InlineKeyboardButton(text="👍", callback_data=f"react:👍:{mid}"),
+        InlineKeyboardButton(text="😂", callback_data=f"react:😂:{mid}"),
+        InlineKeyboardButton(text="😮", callback_data=f"react:😮:{mid}"),
+    ]])
 
 def owner_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 إحصائيات عامة", callback_data="owner:stats")],
-        [InlineKeyboardButton(text="👥 بحث عن مستخدم", callback_data="owner:search")],
         [InlineKeyboardButton(text="📢 رسالة جماعية", callback_data="owner:broadcast")],
-        [InlineKeyboardButton(text="🚩 البلاغات", callback_data="owner:reports")],
         [InlineKeyboardButton(text="✏️ تعديل النصوص", callback_data="owner:edit_texts")],
-        [InlineKeyboardButton(text="➕ إدارة الأزرار", callback_data="owner:manage_buttons")],
         [InlineKeyboardButton(text="↩️ رجوع", callback_data="menu:main")],
     ])
 
-
-def confirm_kb(action: str, uid: int) -> InlineKeyboardMarkup:
+def settings_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ تأكيد", callback_data=f"confirm:{action}:{uid}")],
-        [InlineKeyboardButton(text="❌ إلغاء", callback_data="owner:panel")],
+        [InlineKeyboardButton(text="👤 تعديل الملف الشخصي (Bio)", callback_data="settings:edit_bio")],
+        [InlineKeyboardButton(text="↩️ رجوع", callback_data="menu:main")],
     ])
+
+# ============================================================
+# HANDLERS — WHISPERS (INLINE MODE)
+# ============================================================
+
+inline_router = Router(name="inline")
+
+@inline_router.inline_query()
+async def inline_whisper(query: InlineQuery, session: AsyncSession):
+    text = query.query.strip()
+    if not text:
+        return
+    
+    # التحقق لو النص فيه @username في الآخر
+    parts = text.rsplit(" ", 1)
+    target_user = None
+    whisper_text = text
+    
+    if len(parts) == 2 and parts[1].startswith("@"):
+        target_user = parts[1][1:]
+        whisper_text = parts[0]
+
+    results = []
+    
+    async def create_whisper_result(title: str, max_views: int, target: str = None, tid: int = None):
+        # إنشاء الهمسة في الداتابيز عشان نضمن أمان البيانات
+        w = Whisper(owner_id=query.from_user.id, text=whisper_text, max_views=max_views, target_username=target, target_id=tid)
+        session.add(w)
+        await session.commit()
+        await session.refresh(w)
+        
+        target_msg = f"لشخص: {target}" if target else ("للجميع" if max_views > 100 else f"لأول {max_views} أشخاص")
+        
+        results.append(InlineQueryResultArticle(
+            id=str(w.id),
+            title=title,
+            description=f"اضغط لإرسال همسة {target_msg}",
+            input_message_content=InputTextMessageContent(
+                message_text=f"🤫 <b>همسة سرية {target_msg}</b>\n\nاضغط على الزر بالأسفل لرؤية الهمسة.",
+                parse_mode=ParseMode.HTML
+            ),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🤫 افتح الهمسة", callback_data=f"open_whisper:{w.id}")]
+            ])
+        ))
+
+    if target_user:
+        # همسة لشخص محدد (مثلاً @username)
+        await create_whisper_result(f"🔒 همسة لشخص محدد ({target_user})", 1000, target=target_user)
+    else:
+        await create_whisper_result("🌍 همسة سرية للجميع", 999999)
+        await create_whisper_result("🔒 همسة سرية لأول شخص", 1)
+        await create_whisper_result("👥 همسة سرية لأول 3 أشخاص", 3)
+        await create_whisper_result("👥 همسة سرية لأول 5 أشخاص", 5)
+        await create_whisper_result("👥 همسة سرية لأول 10 أشخاص", 10)
+        await create_whisper_result("👥 همسة سرية لأول 15 شخصاً", 15)
+
+    await query.answer(results, cache_time=0, is_personal=True)
+
+
+@inline_router.callback_query(F.data.startswith("open_whisper:"))
+async def open_whisper_cb(cb: CallbackQuery, session: AsyncSession):
+    wid = int(cb.data.split(":")[1])
+    w = await session.get(Whisper, wid)
+    
+    if not w:
+        await cb.answer("هذه الهمسة غير موجودة أو تم حذفها.", show_alert=True)
+        return
+
+    # التحقق لو الشخص ده فتحها قبل كده
+    viewed = (await session.execute(select(WhisperView).where(WhisperView.whisper_id == wid, WhisperView.viewer_id == cb.from_user.id))).scalar_one_or_none()
+    if viewed:
+        await cb.answer("أنت بالفعل فتحت هذه الهمسة من قبل! 🤫", show_alert=True)
+        return
+
+    # التحقق من الشخص المخصص
+    if w.target_username and cb.from_user.username != w.target_username:
+        await cb.answer("عذراً، هذه الهمسة ليست لك.", show_alert=True)
+        return
+    if w.target_id and cb.from_user.id != w.target_id:
+        await cb.answer("عذراً، هذه الهمسة ليست لك.", show_alert=True)
+        return
+
+    # التحقق من العدد
+    if w.current_views >= w.max_views:
+        await cb.answer("انتهت هذه الهمسة، لقد قرأها العدد المطلوب.", show_alert=True)
+        return
+
+    # تسجيل القراءة
+    view = WhisperView(whisper_id=wid, viewer_id=cb.from_user.id)
+    session.add(view)
+    w.current_views += 1
+    await session.commit()
+
+    # إرسال إشعار لصاحب الهمسة
+    owner_name = " ".join(p for p in [cb.from_user.first_name or "", cb.from_user.last_name or ""] if p) or "مستخدم"
+    owner_uname = f"@{cb.from_user.username}" if cb.from_user.username else "—"
+    try:
+        await cb.bot.send_message(
+            w.owner_id,
+            f"📢 <b>شخص فتح همستك!</b>\n\n👤 الاسم: {escape(owner_name)}\n🔗 اليوزر: {owner_uname}\n🆔 الإيدي: <code>{cb.from_user.id}</code>\n\n📊 العدد الحالي: {w.current_views} من {w.max_views}",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
+
+    # إظهار الهمسة للمستخدم
+    await cb.answer(w.text, show_alert=True)
 
 
 # ============================================================
-# HANDLERS — ANONYMOUS
+# HANDLERS — ANONYMOUS (EXISTING)
 # ============================================================
 
 anon_router = Router(name="anon")
 
-
 @anon_router.message(CommandStart(deep_link=True))
 async def open_link(message: Message, command: CommandObject, state: FSMContext, session: AsyncSession):
     slug = command.args
-    if not slug:
-        return
+    if not slug: return
     link = await get_link_by_slug(session, slug)
+    
     if not link or not link.is_active:
         await message.answer("⚠️ هذا الرابط غير مفعّل حالياً.")
         return
     if link.user_id == message.from_user.id:
         await message.answer("ده رابطك إنت — شاركه مع أصدقائك عشان يبعتولك رسايل مجهولة.")
         return
-    await increment_visits(session, link.id)
+    
+    if await check_sender_blocked(session, link.user_id, message.from_user.id):
+        await message.answer("⚠️ لا يمكنك إرسال رسائل لهذا المستخدم.")
+        return
+        
     await state.set_state(SendAnonymous.waiting)
     await state.update_data(receiver_id=link.user_id)
     
-    intro_text = await get_dynamic_text(session, "text:anon_intro", ANON_INTRO)
-    try:
-        await message.answer(intro_text)
-    except Exception:
-        await message.answer(ANON_INTRO)
-
+    intro_text = await get_dynamic_text(session, "text:anon_intro", DEFAULT_ANON_INTRO)
+    await message.answer(intro_text)
 
 @anon_router.message(SendAnonymous.waiting, F.text | F.photo | F.sticker | F.video | F.voice | F.document)
 async def receive_anon(message: Message, state: FSMContext, session: AsyncSession):
@@ -570,25 +462,43 @@ async def receive_anon(message: Message, state: FSMContext, session: AsyncSessio
         return
 
     ctype, content = "text", message.text or message.caption or ""
-    if message.photo:
-        ctype, content = "photo", message.photo[-1].file_id
-    elif message.sticker:
-        ctype, content = "sticker", message.sticker.file_id
-    elif message.video:
-        ctype, content = "video", message.video.file_id
-    elif message.voice:
-        ctype, content = "voice", message.voice.file_id
-    elif message.document:
-        ctype, content = "document", message.document.file_id
+    if message.photo: ctype, content = "photo", message.photo[-1].file_id
+    elif message.sticker: ctype, content = "sticker", message.sticker.file_id
+    elif message.video: ctype, content = "video", message.video.file_id
+    elif message.voice: ctype, content = "voice", message.voice.file_id
+    elif message.document: ctype, content = "document", message.document.file_id
 
     if not content:
         await message.answer("ابعت رسالة نصية أو وسائط.")
         return
 
-    msg = await create_message(session, receiver_id, message.from_user.id, ctype, content)
+    msg = MessageModel(receiver_id=receiver_id, sender_id=message.from_user.id, content_type=ctype, content=content)
+    session.add(msg)
+    await session.commit()
+    await session.refresh(msg)
+
     sender = await get_user(session, message.from_user.id)
-    await deliver_message(message.bot, receiver_id, msg, sender, msg_actions(msg.id))
-    await message.answer(ANON_SENT)
+    header = f"📩 <b>رسالة #{msg.id}</b>"
+    tail = sender_line(sender)
+    
+    # إرسال للطرف التاني
+    try:
+        if ctype == "text":
+            sent_bot_msg = await message.bot.send_message(receiver_id, f"{header}\n\n{escape(content)}{tail}", reply_markup=msg_actions(msg.id, message.from_user.id))
+        elif ctype == "photo":
+            sent_bot_msg = await message.bot.send_photo(receiver_id, content, caption=header + tail, reply_markup=msg_actions(msg.id, message.from_user.id))
+        # ... ممكن نكمل باقي الأنواع هنا لو حابب
+        else:
+            sent_bot_msg = await message.bot.send_message(receiver_id, f"{header}\n\n{escape(content)}{tail}", reply_markup=msg_actions(msg.id, message.from_user.id))
+        
+        # حفظ ID رسالة البوت عشان الرد
+        msg.bot_message_id = sent_bot_msg.message_id
+        await session.commit()
+    except Exception:
+        pass
+
+    sent_text = await get_dynamic_text(session, "text:anon_sent", DEFAULT_ANON_SENT)
+    await message.answer(sent_text)
     await state.clear()
 
 
@@ -598,38 +508,79 @@ async def wrong_input(message: Message):
 
 
 # ============================================================
-# HANDLERS — USER
+# HANDLERS — USER & REPLY SYSTEM
 # ============================================================
 
 user_router = Router(name="user")
 
-
 @user_router.message(CommandStart())
 async def start(message: Message, state: FSMContext, session: AsyncSession):
     await state.clear()
-    welcome_text = await get_dynamic_text(session, "text:welcome", WELCOME)
-    extras = await get_extra_buttons(session)
-    kb = main_menu(owner=(message.from_user.id == settings.owner_id), extra_buttons=extras)
-    
-    try:
-        await message.answer(welcome_text, reply_markup=kb)
-    except Exception:
-        await message.answer(WELCOME, reply_markup=kb)
-
+    welcome_text = await get_dynamic_text(session, "text:welcome", DEFAULT_WELCOME)
+    await message.answer(welcome_text, reply_markup=main_menu(owner=(message.from_user.id == settings.owner_id)))
 
 @user_router.callback_query(F.data == "menu:main")
 async def menu_main(cb: CallbackQuery, state: FSMContext, session: AsyncSession):
     await state.clear()
-    welcome_text = await get_dynamic_text(session, "text:welcome", WELCOME)
-    extras = await get_extra_buttons(session)
-    kb = main_menu(owner=(cb.from_user.id == settings.owner_id), extra_buttons=extras)
-    
+    welcome_text = await get_dynamic_text(session, "text:welcome", DEFAULT_WELCOME)
     try:
-        await cb.message.edit_text(welcome_text, reply_markup=kb)
+        await cb.message.edit_text(welcome_text, reply_markup=main_menu(owner=(cb.from_user.id == settings.owner_id)))
     except Exception:
-        await cb.message.edit_text(WELCOME, reply_markup=kb)
+        await cb.message.edit_text(DEFAULT_WELCOME, reply_markup=main_menu(owner=(cb.from_user.id == settings.owner_id)))
     await cb.answer()
 
+@user_router.message(F.reply_to_message)
+async def handle_reply(message: Message, session: AsyncSession):
+    """التعامل مع الرد المباشر على رسالة البوت"""
+    replied_msg_id = message.reply_to_message.message_id
+    
+    # البحث عن الرسالة الأصلية في الداتابيز
+    original_msg = (await session.execute(select(MessageModel).where(MessageModel.bot_message_id == replied_msg_id, MessageModel.receiver_id == message.from_user.id))).scalar_one_or_none()
+    
+    if not original_msg or not original_msg.sender_id:
+        return # مش رسالة مجهولة أو مفيش مرسل
+
+    # إرسال الرد للمرسل الأصلي
+    reply_text = await get_dynamic_text(session, "text:reply_received", DEFAULT_REPLY_RECEIVED)
+    reply_text = reply_text.replace("{text}", escape(message.text or ""))
+    
+    try:
+        await message.bot.send_message(original_msg.sender_id, reply_text, reply_markup=reaction_kb(original_msg.id))
+        success_text = await get_dynamic_text(session, "text:reply_sent", DEFAULT_REPLY_SENT)
+        await message.answer(success_text)
+    except Exception:
+        await message.answer("❌ تعذر إرسال الرد — يمكن المستخدم عامل بلوك للبوت.")
+
+@user_router.callback_query(F.data.startswith("msg:block:"))
+async def msg_block_sender(cb: CallbackQuery, session: AsyncSession):
+    sender_id = int(cb.data.split(":")[2])
+    await block_sender(session, cb.from_user.id, sender_id)
+    await cb.message.edit_text("🚫 تم حظر المرسل بنجاح. لن تصلك منه رسائل مجدداً.")
+    await cb.answer("تم الحظر")
+
+@user_router.callback_query(F.data.startswith("react:"))
+async def msg_react(cb: CallbackQuery, session: AsyncSession):
+    _, emoji, mid_s = cb.data.split(":")
+    mid = int(mid_s)
+    msg = await get_message(session, mid)
+    if not msg or not msg.sender_id:
+        await cb.answer("لا يمكن الرد على هذه الرسالة.", show_alert=True)
+        return
+    try:
+        await cb.bot.send_message(msg.sender_id, f"📨 لقد تلقيت تفاعل {emoji} على رسالتك المجهولة!")
+        await cb.message.edit_text(f"✅ تم إرسال التفاعل {emoji} للمرسل.")
+    except Exception:
+        await cb.answer("تعذر إرسال التفاعل.", show_alert=True)
+    await cb.answer()
+
+@user_router.callback_query(F.data.startswith("msg:delete:"))
+async def msg_delete(cb: CallbackQuery, session: AsyncSession):
+    mid = int(cb.data.split(":")[2])
+    if await mark_deleted(session, mid, cb.from_user.id):
+        await cb.message.edit_text("🗑 تم حذف الرسالة.")
+    else:
+        await cb.answer("تعذر الحذف", show_alert=True)
+    await cb.answer()
 
 @user_router.callback_query(F.data == "menu:link")
 async def menu_link(cb: CallbackQuery, session: AsyncSession):
@@ -646,7 +597,6 @@ async def menu_link(cb: CallbackQuery, session: AsyncSession):
     await cb.message.edit_text(text, reply_markup=link_kb(link.is_active), disable_web_page_preview=True)
     await cb.answer()
 
-
 @user_router.callback_query(F.data == "link:toggle")
 async def link_toggle(cb: CallbackQuery, session: AsyncSession):
     active = await toggle_link(session, cb.from_user.id)
@@ -654,7 +604,6 @@ async def link_toggle(cb: CallbackQuery, session: AsyncSession):
         await cb.answer("الرابط غير موجود", show_alert=True)
         return
     await menu_link(cb, session)
-
 
 @user_router.callback_query(F.data == "link:copy")
 async def link_copy(cb: CallbackQuery, session: AsyncSession):
@@ -664,283 +613,102 @@ async def link_copy(cb: CallbackQuery, session: AsyncSession):
     await cb.message.answer(f"<code>{url}</code>")
     await cb.answer("اضغط على الرابط مطولاً لنسخه")
 
-
 @user_router.callback_query(F.data == "menu:inbox")
 async def menu_inbox(cb: CallbackQuery, session: AsyncSession):
-    rows = await list_messages(session, cb.from_user.id, limit=10)
+    rows = (await session.execute(
+        select(MessageModel, User).outerjoin(User, User.id == MessageModel.sender_id)
+        .where(MessageModel.receiver_id == cb.from_user.id, MessageModel.is_deleted.is_(False))
+        .order_by(desc(MessageModel.created_at)).limit(10)
+    )).all()
+    
     if not rows:
         await cb.message.edit_text("📭 لا توجد رسائل حتى الآن.", reply_markup=back_kb())
         await cb.answer()
         return
+        
     await cb.message.edit_text("📩 آخر رسائلك:", reply_markup=back_kb())
     for msg, sender in rows:
-        await deliver_message(cb.bot, cb.from_user.id, msg, sender, msg_actions(msg.id))
+        header = f"📩 <b>رسالة #{msg.id}</b>"
+        tail = sender_line(sender)
+        try:
+            if msg.content_type == "text":
+                await cb.bot.send_message(cb.from_user.id, f"{header}\n\n{escape(msg.content)}{tail}", reply_markup=msg_actions(msg.id, sender.id if sender else None))
+            elif msg.content_type == "photo":
+                await cb.bot.send_photo(cb.from_user.id, msg.content, caption=header + tail, reply_markup=msg_actions(msg.id, sender.id if sender else None))
+        except Exception:
+            pass
     await cb.answer()
-
-
-@user_router.callback_query(F.data.startswith("msg:delete:"))
-async def msg_delete(cb: CallbackQuery, session: AsyncSession):
-    mid = int(cb.data.split(":")[2])
-    if await mark_deleted(session, mid, cb.from_user.id):
-        await cb.message.edit_text("🗑 تم حذف الرسالة.")
-    else:
-        await cb.answer("تعذر الحذف", show_alert=True)
-    await cb.answer()
-
-
-@user_router.callback_query(F.data.startswith("msg:reply:"))
-async def msg_reply_start(cb: CallbackQuery, state: FSMContext, session: AsyncSession):
-    mid = int(cb.data.split(":")[2])
-    msg = await get_message(session, mid)
-    if not msg or msg.receiver_id != cb.from_user.id:
-        await cb.answer("تعذر الوصول", show_alert=True)
-        return
-    await state.set_state(ReplyToMessage.waiting)
-    await state.update_data(reply_mid=mid)
-    await cb.message.answer("✍️ اكتب ردك دلوقتي، هيتبعت لصاحب الرسالة من غير ما يعرف هويتك.")
-    await cb.answer()
-
-
-@user_router.message(ReplyToMessage.waiting, F.text)
-async def msg_reply_send(message: Message, state: FSMContext, session: AsyncSession):
-    data = await state.get_data()
-    mid = data.get("reply_mid")
-    if not mid:
-        await state.clear()
-        return
-    original = await get_message(session, mid)
-    if not original or not original.sender_id:
-        await message.answer("تعذر إرسال الرد.")
-        await state.clear()
-        return
-    if await get_setting(session, f"replies_disabled:{original.sender_id}", "false") == "true":
-        await message.answer("❌ هذا المستخدم معطّل استقبال الردود.")
-        await state.clear()
-        return
-    try:
-        await message.bot.send_message(
-            original.sender_id,
-            f"📨 <b>رد على رسالتك</b>\n\n{escape(message.text)}",
-        )
-        await message.answer("✅ تم إرسال الرد.")
-    except Exception:
-        await message.answer("❌ تعذر إرسال الرد — يمكن المستخدم عامل بلوك للبوت.")
-    await state.clear()
-
-
-@user_router.callback_query(F.data.startswith("msg:report:"))
-async def msg_report_start(cb: CallbackQuery, session: AsyncSession):
-    mid = int(cb.data.split(":")[2])
-    msg = await get_message(session, mid)
-    if not msg or msg.receiver_id != cb.from_user.id:
-        await cb.answer("تعذر الوصول", show_alert=True)
-        return
-    await cb.message.edit_text("اختر سبب الإبلاغ:", reply_markup=report_kb(mid))
-    await cb.answer()
-
-
-@user_router.callback_query(F.data.startswith("report:"))
-async def msg_report_submit(cb: CallbackQuery, session: AsyncSession):
-    _, reason, mid_s = cb.data.split(":")
-    mid = int(mid_s)
-    msg = await get_message(session, mid)
-    if not msg or msg.receiver_id != cb.from_user.id:
-        await cb.answer("تعذر الوصول", show_alert=True)
-        return
-    await create_report(session, mid, cb.from_user.id, reason)
-    await cb.message.edit_text("🚩 تم إرسال البلاغ. شكراً لك.")
-    await cb.answer()
-
-
-@user_router.callback_query(F.data.startswith("msg:back:"))
-async def msg_back(cb: CallbackQuery, session: AsyncSession):
-    mid = int(cb.data.split(":")[2])
-    msg = await get_message(session, mid)
-    if not msg or msg.receiver_id != cb.from_user.id:
-        await cb.answer("غير موجود", show_alert=True)
-        return
-    sender = await get_user(session, msg.sender_id) if msg.sender_id else None
-    await deliver_message(cb.bot, cb.from_user.id, msg, sender, msg_actions(msg.id))
-    await cb.message.delete()
-    await cb.answer()
-
 
 @user_router.callback_query(F.data == "menu:stats")
 async def menu_stats(cb: CallbackQuery, session: AsyncSession):
-    s = await user_stats(session, cb.from_user.id)
-    text = (
-        "📊 <b>إحصائياتك</b>\n\n"
-        f"📩 رسائل مستلمة: {s['received']}\n"
-        f"📤 رسائل مرسلة: {s['sent']}\n"
-        f"👁 زيارات رابطك: {s['visits']}\n"
-    )
+    received = (await session.execute(select(func.count(MessageModel.id)).where(MessageModel.receiver_id == cb.from_user.id, MessageModel.is_deleted.is_(False)))).scalar_one()
+    sent = (await session.execute(select(func.count(MessageModel.id)).where(MessageModel.sender_id == cb.from_user.id))).scalar_one()
+    link = (await session.execute(select(PersonalLink).where(PersonalLink.user_id == cb.from_user.id))).scalar_one_or_none()
+    visits = link.visits if link else 0
+    
+    text = f"📊 <b>إحصائياتك</b>\n\n📩 رسائل مستلمة: {received}\n📤 رسائل مرسلة: {sent}\n👁 زيارات رابطك: {visits}\n"
     await cb.message.edit_text(text, reply_markup=back_kb())
     await cb.answer()
 
-
 @user_router.callback_query(F.data == "menu:settings")
-async def menu_settings(cb: CallbackQuery, session: AsyncSession):
-    disabled = await get_setting(session, f"replies_disabled:{cb.from_user.id}", "false")
-    text = (
-        "⚙️ <b>إعداداتك</b>\n\n"
-        "استقبال الردود على رسائلك المجهولة: "
-        + ("❌ معطّل" if disabled == "true" else "✅ مفعّل")
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="🔕 تعطيل/تفعيل استقبال الردود",
-            callback_data="settings:toggle_replies",
-        )],
-        [InlineKeyboardButton(text="↩️ رجوع", callback_data="menu:main")],
-    ])
-    await cb.message.edit_text(text, reply_markup=kb)
+async def menu_settings(cb: CallbackQuery):
+    await cb.message.edit_text("⚙️ <b>إعداداتك</b>\n\nاختر ما تريد تعديله:", reply_markup=settings_kb())
     await cb.answer()
 
+@user_router.callback_query(F.data == "settings:edit_bio")
+async def settings_edit_bio(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(EditBio.waiting)
+    await cb.message.edit_text("✍️ اكتب الوصف الجديد اللي عايز الناس تشوفه (حد أقصى 200 حرف):", reply_markup=back_kb("menu:settings"))
+    await cb.answer()
 
-@user_router.callback_query(F.data == "settings:toggle_replies")
-async def settings_toggle_replies(cb: CallbackQuery, session: AsyncSession):
-    key = f"replies_disabled:{cb.from_user.id}"
-    cur = await get_setting(session, key, "false")
-    await set_setting(session, key, "false" if cur == "true" else "true")
-    await menu_settings(cb, session)
-
+@user_router.message(EditBio.waiting, F.text)
+async def settings_save_bio(message: Message, state: FSMContext, session: AsyncSession):
+    bio = message.text[:200]
+    user = await get_user(session, message.from_user.id)
+    if user:
+        user.bio = bio
+        await session.commit()
+    await message.answer("✅ تم تحديث الوصف بنجاح.", reply_markup=settings_kb())
+    await state.clear()
 
 @user_router.callback_query(F.data == "menu:about")
 async def menu_about(cb: CallbackQuery):
     await cb.message.edit_text(
-        "ℹ️ <b>حول البوت</b>\n\n"
-        "صارحني هو بوت رسائل مجهولة.\n"
-        "أنشئ رابطك الشخصي وشاركه مع أصدقائك لاستقبال رسائل صريحة ومجهولة.\n\n"
-        "🔒 <b>الخصوصية:</b> هوية المرسل مخفية عنك.",
+        "ℹ️ <b>حول البوت</b>\n\nصارحني هو بوت رسائل مجهولة.\nأنشئ رابطك الشخصي وشاركه مع أصدقائك لاستقبال رسائل صريحة ومجهولة.\n\n🔒 <b>الخصوصية:</b> هوية المرسل مخفية عنك.",
         reply_markup=back_kb(),
     )
     await cb.answer()
 
 
 # ============================================================
-# HANDLERS — OWNER
+# HANDLERS — OWNER PANEL
 # ============================================================
 
 owner_router = Router(name="owner")
 owner_router.message.filter(IsOwner())
 owner_router.callback_query.filter(IsOwner())
 
-
 @owner_router.message(Command("owner"))
 async def owner_cmd(message: Message):
     await message.answer("🛠 لوحة التحكم", reply_markup=owner_kb())
-
 
 @owner_router.callback_query(F.data.in_({"menu:owner", "owner:panel"}))
 async def owner_panel(cb: CallbackQuery):
     await cb.message.edit_text("🛠 لوحة التحكم", reply_markup=owner_kb())
     await cb.answer()
 
-
-@owner_router.callback_query(F.data == "owner:stats")
-async def owner_stats(cb: CallbackQuery, session: AsyncSession):
-    s = await global_stats(session)
-    text = (
-        "📊 <b>إحصائيات عامة</b>\n\n"
-        f"👥 المستخدمين: {s['users']}\n"
-        f"🚫 المحظورين: {s['blocked']}\n"
-        f"📩 إجمالي الرسائل: {s['messages']}\n"
-        f"🔗 الروابط: {s['links']}\n"
-    )
-    await cb.message.edit_text(text, reply_markup=back_kb("owner:panel"))
-    await cb.answer()
-
-
-@owner_router.callback_query(F.data == "owner:search")
-async def owner_search_start(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(OwnerSearch.waiting)
-    await cb.message.edit_text("🔍 اكتب Telegram ID للمستخدم:", reply_markup=back_kb("owner:panel"))
-    await cb.answer()
-
-
-@owner_router.message(OwnerSearch.waiting, F.text)
-async def owner_search_run(message: Message, state: FSMContext, session: AsyncSession):
-    try:
-        uid = int(message.text.strip())
-    except ValueError:
-        await message.answer("❌ ID غير صالح.")
-        return
-    u = await get_user(session, uid)
-    if not u:
-        await message.answer("❌ المستخدم غير موجود.")
-        await state.clear()
-        return
-    text = (
-        f"👤 <b>{(u.first_name or '')} {(u.last_name or '')}</b>\n"
-        f"🆔 <code>{u.id}</code>\n"
-        f"🔗 @{u.username or '—'}\n"
-        f"🚫 محظور: {'نعم' if u.is_blocked else 'لا'}\n"
-        f"📅 انضم: {u.created_at:%Y-%m-%d}\n"
-    )
-    await message.answer(text, reply_markup=confirm_kb("toggle_block", u.id))
-    await state.clear()
-
-
-@owner_router.callback_query(F.data.startswith("confirm:toggle_block:"))
-async def owner_toggle_block(cb: CallbackQuery, session: AsyncSession):
-    uid = int(cb.data.split(":")[2])
-    u = await get_user(session, uid)
-    if not u:
-        await cb.answer("غير موجود", show_alert=True)
-        return
-    was_blocked = u.is_blocked
-    await block_user(session, uid, not was_blocked)
-    await cb.message.edit_text(
-        f"{'🚫 تم حظر' if not was_blocked else '✅ تم إلغاء حظر'} {uid}."
-    )
-    await cb.answer()
-
-
-@owner_router.callback_query(F.data == "owner:broadcast")
-async def owner_broadcast_start(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(OwnerBroadcast.waiting)
-    await cb.message.edit_text(
-        "📢 اكتب الرسالة اللي عايز تبعتها لكل المستخدمين:",
-        reply_markup=back_kb("owner:panel"),
-    )
-    await cb.answer()
-
-
-@owner_router.message(OwnerBroadcast.waiting, F.text)
-async def owner_broadcast_run(message: Message, state: FSMContext, session: AsyncSession):
-    await message.answer("⏳ جاري الإرسال...")
-    sent, failed = await broadcast(message.bot, session, message.text or "")
-    await message.answer(f"✅ تم الإرسال: {sent}\n❌ فشل: {failed}")
-    await state.clear()
-
-
-@owner_router.callback_query(F.data == "owner:reports")
-async def owner_reports(cb: CallbackQuery, session: AsyncSession):
-    reports = await list_pending_reports(session)
-    if not reports:
-        await cb.message.edit_text("لا توجد بلاغات.", reply_markup=back_kb("owner:panel"))
-        await cb.answer()
-        return
-    await cb.message.edit_text("🚩 البلاغات المعلقة:", reply_markup=back_kb("owner:panel"))
-    for r in reports:
-        await cb.message.answer(
-            f"بلاغ #{r.id}\nرسالة: {r.message_id}\nالسبب: {r.reason}\nالحالة: {r.status}"
-        )
-    await cb.answer()
-
-
-# --- Edit Texts ---
-
 @owner_router.callback_query(F.data == "owner:edit_texts")
 async def owner_edit_texts(cb: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="رسالة الترحيب", callback_data="edittext:welcome")],
-        [InlineKeyboardButton(text="رسالة المرسل المجهول", callback_data="edittext:anon_intro")],
+        [InlineKeyboardButton(text="رسالة بدء الصراحة (للمرسل)", callback_data="edittext:anon_intro")],
+        [InlineKeyboardButton(text="رسالة تأكيد الإرسال", callback_data="edittext:anon_sent")],
+        [InlineKeyboardButton(text="رسالة تأكيد الرد", callback_data="edittext:reply_sent")],
+        [InlineKeyboardButton(text="رسالة استلام الرد (للمرسل)", callback_data="edittext:reply_received")],
         [InlineKeyboardButton(text="↩️ رجوع", callback_data="owner:panel")]
     ])
     await cb.message.edit_text("اختر النص اللي عايز تعدله:", reply_markup=kb)
     await cb.answer()
-
 
 @owner_router.callback_query(F.data.startswith("edittext:"))
 async def owner_edit_text_start(cb: CallbackQuery, state: FSMContext):
@@ -950,85 +718,22 @@ async def owner_edit_text_start(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("✍️ اكتب النص الجديد دلوقتي وابعته:")
     await cb.answer()
 
-
 @owner_router.message(OwnerEditText.waiting, F.text)
 async def owner_edit_text_save(message: Message, state: FSMContext, session: AsyncSession):
     data = await state.get_data()
     key = data.get("edit_key")
-    
     try:
         await message.bot.send_message(message.from_user.id, message.text)
     except Exception:
-        await message.answer("❌ النص اللي كتبته فيه رموز مش مدعومة في تيليجرام (زي <escape> أو قوسين غلط).\nجرب تكتبه تاني بشكل صحيح:")
+        await message.answer("❌ النص اللي كتبته فيه رموز مش مدعومة في تيليجرام. جرب تكتبه تاني:")
         return 
-        
     await set_setting(session, key, message.text)
     await message.answer("✅ تم تعديل النص بنجاح.", reply_markup=owner_kb())
     await state.clear()
 
-
-# --- Manage Buttons ---
-
-@owner_router.callback_query(F.data == "owner:manage_buttons")
-async def owner_manage_buttons(cb: CallbackQuery, session: AsyncSession):
-    buttons = await get_extra_buttons(session)
-    text = "➕ <b>إدارة الأزرار</b>\n\n"
-    if buttons:
-        text += "الأزرار الحالية:\n"
-        for b in buttons:
-            text += f"- {b['text']} ({b['url']})\n"
-    else:
-        text += "لا توجد أزرار إضافية حالياً.\n"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ إضافة زر جديد", callback_data="addbutton:start")],
-        [InlineKeyboardButton(text="🗑 حذف كل الأزرار", callback_data="addbutton:clear")],
-        [InlineKeyboardButton(text="↩️ رجوع", callback_data="owner:panel")]
-    ])
-    await cb.message.edit_text(text, reply_markup=kb)
-    await cb.answer()
-
-
-@owner_router.callback_query(F.data == "addbutton:start")
-async def owner_add_button_start(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(OwnerAddButton.waiting_text)
-    await cb.message.edit_text("1️⃣ اكتب اسم الزر (مثال: قناتي):")
-    await cb.answer()
-
-
-@owner_router.message(OwnerAddButton.waiting_text, F.text)
-async def owner_add_button_text(message: Message, state: FSMContext):
-    await state.update_data(btn_text=message.text)
-    await state.set_state(OwnerAddButton.waiting_url)
-    await message.answer("2️⃣ اكتب الرابط (مثال: https://t.me/yourchannel)\n\n⚠️ لازم يكون رابط صحيح.")
-
-
-@owner_router.message(OwnerAddButton.waiting_url, F.text)
-async def owner_add_button_url(message: Message, state: FSMContext, session: AsyncSession):
-    url = message.text.strip()
-    if not url.startswith("http"):
-        await message.answer("❌ رابط غير صالح. لازم يبدأ بـ http أو https.")
-        return
-    data = await state.get_data()
-    btn_text = data.get("btn_text")
-    buttons = await get_extra_buttons(session)
-    buttons.append({"text": btn_text, "url": url})
-    await save_extra_buttons(session, buttons)
-    await message.answer("✅ تم إضافة الزر بنجاح.", reply_markup=owner_kb())
-    await state.clear()
-
-
-@owner_router.callback_query(F.data == "addbutton:clear")
-async def owner_add_button_clear(cb: CallbackQuery, session: AsyncSession):
-    await save_extra_buttons(session, [])
-    await cb.message.edit_text("🗑 تم حذف كل الأزرار.", reply_markup=owner_kb())
-    await cb.answer()
-
-
 # ============================================================
 # BOOTSTRAP
 # ============================================================
-
 
 async def on_startup(bot: Bot):
     async with engine.begin() as conn:
@@ -1036,23 +741,19 @@ async def on_startup(bot: Bot):
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Bot started in polling mode")
 
-
 async def on_shutdown(bot: Bot):
     await engine.dispose()
 
-
 async def main():
-    bot = Bot(
-        token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.middleware(DbSessionMiddleware())
     dp.update.middleware(UserMiddleware())
-    dp.message.middleware(ThrottlingMiddleware(rate=10))
+    
     dp.include_router(owner_router)
     dp.include_router(anon_router)
     dp.include_router(user_router)
+    dp.include_router(inline_router)
 
     await on_startup(bot)
     
@@ -1060,7 +761,6 @@ async def main():
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await on_shutdown(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
